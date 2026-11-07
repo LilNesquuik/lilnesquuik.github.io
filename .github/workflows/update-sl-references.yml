@@ -1,15 +1,18 @@
-# Keeps SLReferences.zip in step with the SCP: Secret Laboratory dedicated server (Steam app 996560): installs it,
-# compares its SCPSL_Data/Managed assemblies with the zip, and when they changed rebuilds the zip (those assemblies
-# plus publicized Assembly-CSharp and Mirror) and commits it. Pages then serves the new file.
+# Keeps SLReferences.zip in step with the SCP: Secret Laboratory dedicated server (Steam app 996560). Every day it
+# asks Steam for the build of the public branch and compares it with SLReferences.build. On a new build it installs
+# the server, compares its SCPSL_Data/Managed assemblies with the zip, rebuilds the zip when they changed (those
+# assemblies plus publicized Assembly-CSharp and Mirror), and commits it with the new build number. Pages then serves
+# the new file.
 name: Update SLReferences.zip
 
 on:
   schedule:
-    - cron: '23 5 * * *'
+    - cron: '1 21 * * *'
+      timezone: Europe/Paris
   workflow_dispatch:
     inputs:
       force:
-        description: Rebuild and commit the zip even when the game assemblies did not change.
+        description: Install the server and rebuild the zip even when the Steam build did not change.
         type: boolean
         default: false
 
@@ -41,27 +44,64 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Set up SteamCMD
+        id: steamcmd
+        run: |
+          $steamCmd = Join-Path $env:RUNNER_TEMP 'steamcmd'
+          New-Item -ItemType Directory -Force -Path $steamCmd | Out-Null
+          $archive = Join-Path $steamCmd 'steamcmd.zip'
+          Invoke-WebRequest https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip -OutFile $archive -UseBasicParsing
+          Expand-Archive -LiteralPath $archive -DestinationPath $steamCmd -Force
+          $exe = Join-Path $steamCmd 'steamcmd.exe'
+
+          # A fresh SteamCMD updates itself on its first run and exits before doing anything else.
+          & $exe +quit | Out-Null
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+          $global:LASTEXITCODE = 0
+
+      # Reads the build of the public branch without installing anything.
+      - name: Check the Steam build
+        id: build
+        env:
+          STEAMCMD: ${{ steps.steamcmd.outputs.exe }}
+        run: |
+          $latest = ''
+          foreach ($attempt in 1..3) {
+            $info = & $env:STEAMCMD +login anonymous +app_info_update 1 +app_info_print $env:APP_ID +quit | Out-String
+            $latest = [regex]::Match($info, '"branches"\s*\{\s*"public"\s*\{\s*"buildid"\s*"(\d+)"').Groups[1].Value
+            if ($latest) { break }
+            Write-Warning "SteamCMD attempt $attempt returned no build for app $env:APP_ID."
+            Start-Sleep -Seconds 15
+          }
+
+          if (-not $latest) {
+            Write-Output "::error::Could not read the public build of app $env:APP_ID from Steam."
+            exit 1
+          }
+
+          $known = if (Test-Path SLReferences.build) { (Get-Content SLReferences.build -Raw).Trim() } else { '' }
+          "Steam build $latest, SLReferences.zip built from $(if ($known) { $known } else { 'an unknown build' })."
+          "latest=$latest" >> $env:GITHUB_OUTPUT
+          "current=$($latest -eq $known)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+          $global:LASTEXITCODE = 0
+
       - uses: actions/setup-dotnet@v6
+        if: steps.build.outputs.current != 'true' || inputs.force
         with:
           dotnet-version: 10.0.x
 
       - name: Install the dedicated server
         id: server
+        if: steps.build.outputs.current != 'true' || inputs.force
+        env:
+          STEAMCMD: ${{ steps.steamcmd.outputs.exe }}
         run: |
-          $steamCmd = Join-Path $env:RUNNER_TEMP 'steamcmd'
           $server = Join-Path $env:RUNNER_TEMP 'server'
-          New-Item -ItemType Directory -Force -Path $steamCmd, $server | Out-Null
-          $archive = Join-Path $steamCmd 'steamcmd.zip'
-          Invoke-WebRequest https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip -OutFile $archive -UseBasicParsing
-          Expand-Archive -LiteralPath $archive -DestinationPath $steamCmd -Force
-          $exe = Join-Path $steamCmd 'steamcmd.exe'
+          New-Item -ItemType Directory -Force -Path $server | Out-Null
           $marker = Join-Path $server 'SCPSL_Data/Managed/Assembly-CSharp.dll'
 
-          # A fresh SteamCMD updates itself on its first run and exits before app_update.
-          & $exe +quit | Out-Null
-
           foreach ($attempt in 1..3) {
-            & $exe +force_install_dir $server +login anonymous +app_update $env:APP_ID validate +quit
+            & $env:STEAMCMD +force_install_dir $server +login anonymous +app_update $env:APP_ID validate +quit
             # SteamCMD exit codes are unreliable: trust the installed assemblies instead.
             if (Test-Path -LiteralPath $marker) { break }
             Write-Warning "SteamCMD attempt $attempt left no managed assemblies."
@@ -73,15 +113,22 @@ jobs:
             exit 1
           }
 
+          # The installed build, which may be newer than the one checked a few minutes earlier.
           $manifest = Get-Content (Join-Path $server "steamapps/appmanifest_$env:APP_ID.acf") -Raw
-          $buildId = [regex]::Match($manifest, '"buildid"\s+"(\d+)"').Groups[1].Value
+          $installed = [regex]::Match($manifest, '"buildid"\s+"(\d+)"').Groups[1].Value
+          if (-not $installed) {
+            Write-Output "::error::The app manifest has no build id."
+            exit 1
+          }
+
           "managed=$(Join-Path $server 'SCPSL_Data/Managed')" >> $env:GITHUB_OUTPUT
-          "build=$buildId" >> $env:GITHUB_OUTPUT
+          "build=$installed" >> $env:GITHUB_OUTPUT
           $global:LASTEXITCODE = 0
 
       # Publicized copies are generated, so only the game's own assemblies decide whether the zip is stale.
       - name: Compare with the zip
         id: compare
+        if: steps.server.outcome == 'success'
         env:
           MANAGED: ${{ steps.server.outputs.managed }}
         run: |
@@ -106,7 +153,7 @@ jobs:
           "changed=$([bool]$changes)".ToLowerInvariant() >> $env:GITHUB_OUTPUT
 
       - name: Build the zip
-        if: steps.compare.outputs.changed == 'true' || inputs.force
+        if: steps.compare.outputs.changed == 'true' || (steps.server.outcome == 'success' && inputs.force)
         env:
           MANAGED: ${{ steps.server.outputs.managed }}
         run: |
@@ -129,30 +176,37 @@ jobs:
           Compress-Archive -Path (Join-Path $out '*.dll') -DestinationPath SLReferences.zip -CompressionLevel Optimal
           "$((Get-ChildItem $out -Filter *.dll).Count) assemblies, $([math]::Round((Get-Item SLReferences.zip).Length / 1MB, 1)) MB" >> $env:GITHUB_STEP_SUMMARY
 
+      # Records the installed build even when its assemblies did not change, so the next run skips it.
       - name: Commit
-        if: steps.compare.outputs.changed == 'true' || inputs.force
+        if: steps.server.outcome == 'success'
         env:
           BUILD: ${{ steps.server.outputs.build }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          Set-Content -Path SLReferences.build -Value $env:BUILD -NoNewline
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add SLReferences.zip
+          git add SLReferences.zip SLReferences.build
           git diff --cached --quiet
           if ($LASTEXITCODE -eq 0) {
-            Write-Output 'The zip did not change.'
+            "Steam build $env:BUILD: nothing changed." >> $env:GITHUB_STEP_SUMMARY
             exit 0
           }
 
-          git commit -m "Update SLReferences.zip to Steam build $env:BUILD"
+          $zipChanged = git diff --cached --name-only -- SLReferences.zip
+          $message = if ($zipChanged) { "Update SLReferences.zip to Steam build $env:BUILD" } else { "Record Steam build $env:BUILD (assemblies unchanged)" }
+          git commit -m $message
           git push
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-          gh api --method POST "repos/$env:GITHUB_REPOSITORY/pages/builds" --silent
-          "Committed SLReferences.zip for Steam build $env:BUILD." >> $env:GITHUB_STEP_SUMMARY
+          if ($zipChanged) {
+            gh api --method POST "repos/$env:GITHUB_REPOSITORY/pages/builds" --silent
+          }
+
+          "$message." >> $env:GITHUB_STEP_SUMMARY
 
       - name: Summary
-        if: steps.compare.outputs.changed != 'true' && !inputs.force
+        if: steps.build.outputs.current == 'true' && !inputs.force
         env:
-          BUILD: ${{ steps.server.outputs.build }}
-        run: '"Steam build $env:BUILD: the game assemblies match SLReferences.zip, nothing to do." >> $env:GITHUB_STEP_SUMMARY'
+          BUILD: ${{ steps.build.outputs.latest }}
+        run: '"Steam build $env:BUILD is the one SLReferences.zip was built from: nothing to do." >> $env:GITHUB_STEP_SUMMARY'
